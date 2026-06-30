@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coconut Beaver — Taman Sri Muda Flood Telemetry</title>
+    <meta name="description" content="Real-time flood telemetry dashboard for Taman Sri Muda, Klang River Basin. Station 301543.">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦫</text></svg>">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <!-- React -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+    <!-- prop-types (required by Recharts UMD) -->
+    <script crossorigin src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+
+    <!-- Recharts -->
+    <script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+
+    <!-- Babel for JSX -->
+    <script crossorigin src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+
+    <!-- Tailwind -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
+                    colors: { brand: { DEFAULT: '#1F6F5C', dark: '#174f42', light: '#e6f5f0' } }
+                }
+            }
+        }
+    </script>
+    <style>
+        @keyframes pulse-live {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.35; transform: scale(0.85); }
+        }
+        .live-dot { animation: pulse-live 1.5s ease-in-out infinite; }
+
+        @keyframes fade-in-down {
+            from { opacity: 0; transform: translateY(-8px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .alert-enter { animation: fade-in-down 0.35s ease-out; }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            height: 10px;
+            border-radius: 999px;
+            background: linear-gradient(to right, #d1fae5, #fef9c3 55%, #fecaca);
+            outline: none;
+            cursor: pointer;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 28px; height: 28px;
+            border-radius: 50%;
+            background: #1F6F5C;
+            border: 3px solid white;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+            cursor: grab;
+            transition: box-shadow 0.2s;
+        }
+        input[type="range"]::-webkit-slider-thumb:active {
+            cursor: grabbing;
+            box-shadow: 0 2px 12px rgba(31,111,92,0.5);
+        }
+        input[type="range"]::-moz-range-thumb {
+            width: 28px; height: 28px;
+            border-radius: 50%;
+            background: #1F6F5C;
+            border: 3px solid white;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+            cursor: grab;
+        }
+
+        .smooth { transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1); }
+        .smooth-fast { transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); }
+
+        .alert-scroll::-webkit-scrollbar { width: 4px; }
+        .alert-scroll::-webkit-scrollbar-track { background: transparent; }
+        .alert-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
+    </style>
+</head>
+<body class="bg-gray-50 font-sans antialiased">
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+const { useState, useEffect, useRef, useMemo } = React;
+const {
+    ResponsiveContainer, LineChart, Line, XAxis, YAxis,
+    CartesianGrid, Tooltip, ReferenceLine
+} = Recharts;
+
+/* ─── Status thresholds ─── */
+const STATUS_MAP = {
+    NORMAL:  { color: '#16a34a', bg: '#f0fdf4', border: '#86efac' },
+    ALERT:   { color: '#ca8a04', bg: '#fefce8', border: '#fde047' },
+    WARNING: { color: '#ea580c', bg: '#fff7ed', border: '#fdba74' },
+    DANGER:  { color: '#dc2626', bg: '#fef2f2', border: '#fca5a5' },
+};
+
+function getStatus(level) {
+    if (level >= 5.0) return { key: 'DANGER',  ...STATUS_MAP.DANGER };
+    if (level >= 4.7) return { key: 'WARNING', ...STATUS_MAP.WARNING };
+    if (level >= 4.4) return { key: 'ALERT',   ...STATUS_MAP.ALERT };
+    return { key: 'NORMAL', ...STATUS_MAP.NORMAL };
+}
+
+/* ─── Alert definitions ─── */
+const THRESHOLDS = [
+    { value: 4.4, label: 'ALERT',   message: 'River at 4.4m. Monitoring active.',                            color: '#ca8a04' },
+    { value: 4.7, label: 'WARNING', message: 'River at 4.7m. Pre-event SMS dispatched to 80 residents.',     color: '#ea580c' },
+    { value: 5.0, label: 'DANGER',  message: 'River at 5.0m. Capacity critical. MBSA + residents notified.', color: '#dc2626' },
+];
+
+/* ─── Chart data generator ─── */
+function buildChartData(currentLevel) {
+    const data = [];
+    const now = Date.now();
+    // Start the hydrograph from a low base, rising to the current slider value
+    const base = Math.max(1.8, currentLevel - 1.6);
+    for (let i = 0; i <= 11; i++) {
+        const t = i / 11; // 0 → 1
+        // S-curve (sigmoid) for realistic flood hydrograph shape
+        const k = 6;  // steepness
+        const sigmoid = 1 / (1 + Math.exp(-k * (t - 0.55)));
+        // Normalize so sigmoid maps from ~0 to ~1
+        const s0 = 1 / (1 + Math.exp(-k * (0 - 0.55)));
+        const s1 = 1 / (1 + Math.exp(-k * (1 - 0.55)));
+        const eased = (sigmoid - s0) / (s1 - s0);
+        const level = base + (currentLevel - base) * eased;
+        const d = new Date(now - (11 - i) * 3600000);
+        data.push({
+            time: d.toLocaleTimeString('en-MY', { hour: '2-digit', minute: '2-digit', hour12: false }),
+            level: +level.toFixed(2),
+        });
+    }
+    return data;
+}
+
+/* ─── LID capacity calculator ─── */
+function lidCapacity(level, offset) {
+    const maxCap = 85 + offset;
+    if (level <= 4.4) return maxCap;
+    const ratio = Math.min((level - 4.4) / 0.6, 1);
+    return Math.max(10, Math.round(maxCap - (maxCap - (12 + offset)) * ratio));
+}
+
+/* ─── Unique ID helper ─── */
+let _idCounter = 0;
+function uid() {
+    return 'a-' + (++_idCounter) + '-' + Date.now();
+}
+
+/* ═══════════════════════════════════════════
+   MAIN APP
+   ═══════════════════════════════════════════ */
+function App() {
+    const [riverLevel, setRiverLevel] = useState(2.8);
+    const [clock, setClock]           = useState(new Date());
+    const [alerts, setAlerts]         = useState([]);
+    const prevLevel                   = useRef(2.8);
+
+    // Tick clock every second
+    useEffect(() => {
+        const id = setInterval(() => setClock(new Date()), 1000);
+        return () => clearInterval(id);
+    }, []);
+
+    // Generate alerts on threshold crossings
+    useEffect(() => {
+        const prev = prevLevel.current;
+        const curr = riverLevel;
+        const fresh = [];
+        THRESHOLDS.forEach(t => {
+            if (prev < t.value && curr >= t.value) {
+                fresh.push({
+                    id: uid(),
+                    time: new Date().toLocaleTimeString('en-MY', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }),
+                    label: t.label,
+                    message: t.message,
+                    color: t.color,
+                });
+            }
+        });
+        if (fresh.length) setAlerts(a => [...fresh, ...a]);
+        prevLevel.current = curr;
+    }, [riverLevel]);
+
+    const status    = getStatus(riverLevel);
+    const chartData = useMemo(() => buildChartData(riverLevel), [riverLevel]);
+
+    const lids = [
+        { name: 'Dry Well A',          cap: lidCapacity(riverLevel, 5) },
+        { name: 'Bioretention Cell B',  cap: lidCapacity(riverLevel, 0) },
+        { name: 'Compost Zone C',       cap: lidCapacity(riverLevel, -3) },
+    ];
+
+    const timeStr = clock.toLocaleTimeString('en-MY', {
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    });
+
+    return (
+        <div className="min-h-screen bg-gray-50 flex flex-col">
+
+            {/* ───────── TOP BAR ───────── */}
+            <header style={{ backgroundColor: '#1F6F5C' }} className="text-white shadow-lg relative overflow-hidden">
+                <div className="absolute inset-0 opacity-[0.04]"
+                     style={{ backgroundImage: "url(\"data:image/svg+xml,%3Csvg width='20' height='20' xmlns='http://www.w3.org/2000/svg'%3E%3Ccircle cx='2' cy='2' r='1' fill='white'/%3E%3C/svg%3E\")" }} />
+                <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between relative">
+                    <div>
+                        <h1 className="text-xl font-extrabold tracking-tight flex items-center gap-2">
+                            <span className="text-2xl">🦫</span>
+                            Coconut Beaver — Taman Sri Muda Flood Telemetry
+                        </h1>
+                        <p className="text-sm mt-1 font-medium" style={{ color: 'rgba(255,255,255,0.6)' }}>
+                            Jalan Srikandi 25/14 · Station 301543 · Klang River Basin
+                        </p>
+                    </div>
+                    <div className="flex items-center gap-5">
+                        <div className="flex items-center gap-2 rounded-full px-4 py-1.5" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }}>
+                            <span className="w-2.5 h-2.5 rounded-full live-dot" style={{ backgroundColor: '#4ade80' }}></span>
+                            <span className="text-sm font-bold tracking-wide">LIVE</span>
+                        </div>
+                        <div className="text-xl font-mono font-bold" style={{ fontVariantNumeric: 'tabular-nums', letterSpacing: '0.05em' }}>
+                            {timeStr}
+                        </div>
+                    </div>
+                </div>
+            </header>
+
+            <main className="max-w-7xl w-full mx-auto px-6 py-6 space-y-6 flex-1">
+
+                {/* ───────── SLIDER ───────── */}
+                <section className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                    <div className="flex items-center justify-between mb-4">
+                        <label className="text-sm font-bold text-gray-600 uppercase tracking-wider">
+                            Klang River Level (m)
+                        </label>
+                        <div className="smooth-fast flex items-baseline gap-1.5 px-4 py-1.5 rounded-xl"
+                             style={{ backgroundColor: status.bg, border: '1px solid ' + status.border }}>
+                            <span className="text-3xl font-black font-mono smooth-fast"
+                                  style={{ color: status.color, fontVariantNumeric: 'tabular-nums' }}>
+                                {riverLevel.toFixed(1)}
+                            </span>
+                            <span className="text-lg font-bold text-gray-400">m</span>
+                        </div>
+                    </div>
+                    <input
+                        type="range" min="2.0" max="6.0" step="0.1"
+                        value={riverLevel}
+                        onChange={e => setRiverLevel(parseFloat(e.target.value))}
+                        className="w-full"
+                    />
+                    <div className="flex justify-between text-xs text-gray-400 font-medium mt-2 px-0.5">
+                        <span>2.0 m</span>
+                        <span style={{ color: '#ca8a04' }} className="font-semibold">▲ 4.4 Alert</span>
+                        <span style={{ color: '#ea580c' }} className="font-semibold">▲ 4.7 Warning</span>
+                        <span style={{ color: '#dc2626' }} className="font-semibold">▲ 5.0 Danger</span>
+                        <span>6.0 m</span>
+                    </div>
+                </section>
+
+                {/* ───────── MAIN GRID ───────── */}
+                <div className="flex gap-6 items-start">
+
+                    {/* Left column */}
+                    <div className="flex-1 min-w-0 space-y-6">
+
+                        {/* River Status Card */}
+                        <section className="rounded-2xl shadow-sm p-6 smooth"
+                                 style={{ backgroundColor: status.bg, border: '2px solid ' + status.border }}>
+                            <h2 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-3">
+                                River Status
+                            </h2>
+                            <div className="flex items-end gap-5">
+                                <div className="smooth">
+                                    <span className="font-black font-mono leading-none smooth"
+                                          style={{ color: status.color, fontSize: '3.5rem', fontVariantNumeric: 'tabular-nums' }}>
+                                        {riverLevel.toFixed(1)}
+                                    </span>
+                                    <span className="text-2xl font-bold text-gray-400 ml-1">m</span>
+                                </div>
+                                <span className="smooth text-lg font-extrabold px-5 py-2 rounded-full mb-1"
+                                      style={{ color: status.color, backgroundColor: status.color + '18' }}>
+                                    ● {status.key}
+                                </span>
+                            </div>
+                        </section>
+
+                        {/* Line Chart */}
+                        <section className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                            <h2 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-4">
+                                River Level — Last 12 Hours
+                            </h2>
+                            <ResponsiveContainer width="100%" height={300}>
+                                <LineChart data={chartData} margin={{ top: 10, right: 20, bottom: 5, left: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
+                                    <XAxis dataKey="time" tick={{ fontSize: 11, fill: '#94a3b8' }} tickLine={false} />
+                                    <YAxis domain={[1.5, 6.5]}
+                                           tick={{ fontSize: 11, fill: '#94a3b8' }}
+                                           tickLine={false}
+                                           tickFormatter={v => v + 'm'}
+                                           width={45} />
+                                    <Tooltip
+                                        formatter={v => [v + ' m', 'River Level']}
+                                        contentStyle={{ borderRadius: 12, border: '1px solid #e2e8f0', fontSize: 13, boxShadow: '0 4px 12px rgba(0,0,0,0.08)' }}
+                                        labelStyle={{ fontWeight: 600, color: '#475569' }}
+                                    />
+                                    <ReferenceLine y={4.4} stroke="#ca8a04" strokeDasharray="8 4" strokeWidth={1.5}
+                                        label={{ value: 'Alert 4.4m', position: 'insideTopRight', fill: '#ca8a04', fontSize: 11, fontWeight: 600 }} />
+                                    <ReferenceLine y={4.7} stroke="#ea580c" strokeDasharray="8 4" strokeWidth={1.5}
+                                        label={{ value: 'Warning 4.7m', position: 'insideTopRight', fill: '#ea580c', fontSize: 11, fontWeight: 600 }} />
+                                    <ReferenceLine y={5.0} stroke="#dc2626" strokeDasharray="8 4" strokeWidth={1.5}
+                                        label={{ value: 'Danger 5.0m', position: 'insideTopRight', fill: '#dc2626', fontSize: 11, fontWeight: 600 }} />
+                                    <Line
+                                        type="monotone" dataKey="level"
+                                        stroke={status.color} strokeWidth={3}
+                                        dot={false}
+                                        activeDot={{ r: 5, strokeWidth: 2, stroke: 'white', fill: status.color }}
+                                        animationDuration={400}
+                                    />
+                                </LineChart>
+                            </ResponsiveContainer>
+                        </section>
+
+                        {/* LID Storage Capacity */}
+                        <section className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                            <h2 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-5">
+                                LID Storage Capacity
+                            </h2>
+                            <div className="space-y-5">
+                                {lids.map(function(lid) {
+                                    var barColor = lid.cap < 25 ? '#dc2626'
+                                                 : lid.cap < 50 ? '#ea580c'
+                                                 : '#16a34a';
+                                    return (
+                                        <div key={lid.name}>
+                                            <div className="flex justify-between items-baseline text-sm mb-1.5">
+                                                <span className="font-semibold text-gray-700">{lid.name}</span>
+                                                <span className="font-mono font-bold text-sm smooth-fast"
+                                                      style={{ color: barColor }}>
+                                                    {lid.cap}% remaining
+                                                </span>
+                                            </div>
+                                            <div className="h-4 bg-gray-100 rounded-full overflow-hidden">
+                                                <div className="h-full rounded-full smooth"
+                                                     style={{ width: lid.cap + '%', backgroundColor: barColor }}></div>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                            <p className="text-xs text-gray-400 mt-4 italic leading-relaxed">
+                                Capacity falls as river back-pressure saturates sub-surface storage.
+                            </p>
+                        </section>
+                    </div>
+
+                    {/* Right column — Alert Log */}
+                    <aside className="w-80 flex-shrink-0">
+                        <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 sticky top-6">
+                            <h2 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-4 flex items-center justify-between">
+                                <span>Alert Log</span>
+                                {alerts.length > 0 && (
+                                    <span className="text-[10px] font-semibold bg-gray-100 text-gray-500 rounded-full px-2.5 py-0.5" style={{ textTransform: 'none', letterSpacing: 'normal' }}>
+                                        {alerts.length} event{alerts.length !== 1 ? 's' : ''}
+                                    </span>
+                                )}
+                            </h2>
+                            {alerts.length === 0 ? (
+                                <div className="text-center py-10">
+                                    <div className="text-3xl mb-3">🛡️</div>
+                                    <p className="text-sm text-gray-400 font-medium">All clear</p>
+                                    <p className="text-xs text-gray-300 mt-1">
+                                        Move the slider above 4.4 m to trigger alerts.
+                                    </p>
+                                </div>
+                            ) : (
+                                <div className="space-y-0 max-h-[480px] overflow-y-auto alert-scroll pr-1">
+                                    {alerts.map(function(a, i) {
+                                        return (
+                                            <div key={a.id}
+                                                 className={'flex gap-3 py-3 alert-enter' + (i < alerts.length - 1 ? ' border-b border-gray-50' : '')}>
+                                                <span className="w-2.5 h-2.5 rounded-full mt-1 flex-shrink-0"
+                                                      style={{ backgroundColor: a.color }}></span>
+                                                <div className="min-w-0">
+                                                    <div className="flex items-center gap-2 mb-0.5">
+                                                        <span className="text-xs font-extrabold tracking-wide"
+                                                              style={{ color: a.color }}>
+                                                            {a.label}
+                                                        </span>
+                                                        <span className="font-mono text-gray-300" style={{ fontSize: '10px', fontVariantNumeric: 'tabular-nums' }}>
+                                                            {a.time}
+                                                        </span>
+                                                    </div>
+                                                    <p className="text-sm text-gray-600 leading-snug">
+                                                        {a.message}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                    </aside>
+                </div>
+
+                {/* ───────── FOOTER STATS ───────── */}
+                <footer className="grid grid-cols-4 gap-4">
+                    {[
+                        { icon: '📡', label: 'Sensor Nodes', value: '16 online' },
+                        { icon: '🔗', label: 'Gateways',     value: '2 / 2' },
+                        { icon: '👥', label: 'Residents covered', value: '80' },
+                        { icon: '📶', label: 'Network',      value: 'LoRaWAN' },
+                    ].map(function(s) {
+                        return (
+                            <div key={s.label}
+                                 className="bg-white rounded-2xl shadow-sm border border-gray-100 px-5 py-4 flex items-center gap-3.5 hover:shadow-md transition-shadow">
+                                <span className="text-2xl">{s.icon}</span>
+                                <div>
+                                    <div className="text-gray-400 uppercase font-bold" style={{ fontSize: '10px', letterSpacing: '0.1em' }}>
+                                        {s.label}
+                                    </div>
+                                    <div className="text-sm font-extrabold text-gray-800 mt-0.5">{s.value}</div>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </footer>
+            </main>
+
+            {/* Bottom edge accent */}
+            <div className="h-1" style={{ background: 'linear-gradient(to right, #1F6F5C, rgba(31,111,92,0.3), transparent)' }}></div>
+        </div>
+    );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
